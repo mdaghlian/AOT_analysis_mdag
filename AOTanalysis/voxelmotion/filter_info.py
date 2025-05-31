@@ -65,7 +65,7 @@ class FilterInfo:
             'pol': pol,
             'SFimg': params['spatial_freq'],
             'SF': params['spatial_freq']/self.dov_per_scr1,  # cycle/image * 1/(deg/image) = cycle/degree 
-            'size': params['spatial_env']/self.dov_per_scr1,   # s.d (image) * 1/(deg/image) = deg
+            'size': params['spatial_env']*self.dov_per_scr1,   # s.d (image) * (deg/image) = deg
             'TF': params['temporal_freq'],
             'dir': params['direction'],
         }
@@ -100,25 +100,33 @@ class FilterInfo:
         sensitivity = (np.max(collapsed_ws, axis=0) - np.min(collapsed_ws, axis=0)) / np.sum(collapsed_ws, axis=0)
         return sensitivity
 
-    def filter_weighted_mean(self, weights, params=None):
+    def filter_weighted_mean(self, w, params=None, option='clamp'):
         """
         Compute weighted means for a set of weight vectors.
         weights: array of shape (n_filters, N)
         Returns: DataFrame of shape (N, len(params))
-        """
-        w = np.asarray(weights)
+        """        
         if w.ndim == 1:
             w = w[:, None]
         if w.shape[0] != self.n_filters:
             raise ValueError("Weights must have shape (n_filters, N)")
-
         if params is None:
             params = self.params_list
         # sum of weights per column
-        wsum = w.sum(axis=0)
+        # How to deal with negative weights? 
+        # -> problem is you can get sumw nearly 0...
+        if option=='clamp':
+            # No negative weights
+            w = np.maximum(w, 0)
+            wsum = w.sum(axis=0)
+        elif option=='L1':
+            # Avoids wsum=0
+            wsum = np.abs(w).sum(axis=0)
+        elif option=='none':
+            wsum = w.sum(axis=0)
         out = {}
         for p in params: 
-            if p in ['x', 'y', 'ecc', 'SF', 'size', 'TF', 'vel']:
+            if p in ['x', 'y', 'SF', 'size', 'TF', 'vel']:
                 # straightforward means
                 arr = self._arrays[p][:, None]  # shape (F,1)
                 mean_vals = (w * arr).sum(axis=0) / wsum
@@ -129,6 +137,12 @@ class FilterInfo:
                 my = ((w * self._arrays['y'][:, None]).sum(axis=0) / wsum)
                 _, pol_mean = self._cart2pol(mx, my)
                 out['pol'] = pol_mean
+            elif p in ['ecc']:
+                # polarity: from x,y means
+                mx = ((w * self._arrays['x'][:, None]).sum(axis=0) / wsum)
+                my = ((w * self._arrays['y'][:, None]).sum(axis=0) / wsum)
+                ecc_mean,_ = self._cart2pol(mx, my)
+                out['ecc'] = ecc_mean
             elif p in ['dir']:
                 # direction: circular mean
                 theta = np.deg2rad(self._arrays['dir'])[:, None]
@@ -139,13 +153,13 @@ class FilterInfo:
         # assemble DataFrame
         return pd.DataFrame(out)
 
-    def filter_max(self, weights, params=None):
+    def filter_max(self, w, params=None):
         """
         For each weight vector, return parameters at index of max weight.
         weights: array (n_filters, N)
         Returns: DataFrame (N, len(params))
         """
-        w = np.asarray(weights)
+        w = np.asarray(w)
         if w.ndim == 1:
             w = w[:, None]
         if w.shape[0] != self.n_filters:
@@ -205,30 +219,32 @@ class FilterInfo:
 
 
 
-class NishiStim(FilterInfo):
+class RespEstimate(FilterInfo):
     def __init__(self, **kwargs):
         # Initialize with the FilterInfo class..
         super().__init__(**kwargs)
         
 
-    def _stim_make_space(self,n_frames=24, grid_size=(17, 17), **kwargs):
+    def _stim_make_space(self,nframe=60, grid_size=(17, 17), **kwargs):
         # Going to splid 
+        print(self.vhsize)
         downsample = kwargs.get('downsample', 1)
         vhsize = self.vhsize[0]//downsample, self.vhsize[1]//downsample
         print(f'Downsampled vhsize = {vhsize}')
+        print(self.vhsize)
         self.stim_space = {}
         self.stim_space['downsample'] = downsample
         self.stim_space['grid_size'] = grid_size
         self.stim_space['filt_resp'] = []
         self.stim_space['filt_resp_avg'] = []
-        self.stim_space['filt_x']   = []
-        self.stim_space['filt_y']   = []
+        self.stim_space['stim_x']   = []
+        self.stim_space['stim_y']   = []
 
         i_total = 0
         for ix in range(grid_size[0]):
             for iy in range(grid_size[1]):
                 mat,pix_x,pix_y = generate_dynamic_gaussian_noise(
-                    n_frames=n_frames, 
+                    nframe=nframe, 
                     grid_size=grid_size, 
                     vhsize=vhsize, 
                     grid_location=[ix,iy], 
@@ -240,8 +256,8 @@ class NishiStim(FilterInfo):
                     yscr=pix_y / vhsize[0],
 
                 )
-                self.stim_space['filt_x'].append(xdov)
-                self.stim_space['filt_y'].append(ydov)
+                self.stim_space['stim_x'].append(xdov)
+                self.stim_space['stim_y'].append(ydov)
                 fresp = self.pyramid.project_stimulus(mat,use_cuda=True,)
                 self.stim_space['filt_resp'].append(fresp.copy())
                 self.stim_space['filt_resp_avg'].append(
@@ -249,19 +265,19 @@ class NishiStim(FilterInfo):
                 )
                 
     
-    def _stim_make_gray(self,n_frames=24, **kwargs):
+    def _stim_make_gray(self,nframe=60, **kwargs):
         # Going to splid 
         downsample = kwargs.get('downsample', 1)
         vhsize = self.vhsize[0]//downsample, self.vhsize[1]//downsample
         print(f'Downsampled vhsize = {vhsize}')
         self.stim_gray = {}
         self.stim_gray['downsample'] = downsample
-        mat = np.zeros((n_frames, vhsize[0], vhsize[1]), dtype=float) + 50.0
+        mat = np.zeros((nframe, vhsize[0], vhsize[1]), dtype=float) + 50.0
         fresp =self.pyramid.project_stimulus(mat,use_cuda=True,)
         self.stim_gray['filt_resp'] = fresp.copy()
         self.stim_gray['filt_resp_avg'] = np.mean(fresp, axis=0)        
 
-    def _stim_make_tfsf(self, n_frames=24,  **kwargs):
+    def _stim_make_tfsf(self, nframe=60,  **kwargs):
         '''
         Generate full-field drifting sine-wave gratings at specified temporal
         frequency (tf), spatial frequency (sf), and orientation (dir).
@@ -291,7 +307,7 @@ class NishiStim(FilterInfo):
                         vhsize=vhsize,
                         stimulus_fps=frame_rate,
                         aspect_ratio=self.aspect_ratio,
-                        nframe=n_frames,
+                        nframe=nframe,
                         direction=dir,
                         spatial_freq=sf,
                         temporal_freq=tf,
@@ -305,7 +321,7 @@ class NishiStim(FilterInfo):
                     if sf==0.0:
                         # only one direction for sf 0
                         break
-    def _pref_space(self, w):
+    def _pref_space(self, w, **kwargs):
         ''' Compute spatial preference
         
         w : weights n filters x n vox
@@ -315,6 +331,7 @@ class NishiStim(FilterInfo):
         mat : X x Y x n vox 
         -> where X and Y are taken from the 
         '''
+        return_idx = kwargs.get('return_idx', False)
         if w.ndim == 1:
             w = w[:, None]
         if w.shape[0] != self.n_filters:
@@ -324,15 +341,23 @@ class NishiStim(FilterInfo):
         filt_resp_mat = np.vstack(self.stim_space['filt_resp_avg'])
         space_resp = (filt_resp_mat @ w) - gray_resp[...,np.newaxis].T
         # Now average over 
-        xs = np.array(self.stim_space['filt_x'])
+        xs = np.array(self.stim_space['stim_x'])
         u_xs = np.unique(xs)
-        ys = np.array(self.stim_space['filt_y'])
+        ys = np.array(self.stim_space['stim_y'])
         u_ys = np.unique(ys)
         mat = np.zeros((len(u_xs), len(u_ys), w.shape[1]))
+        idx_mat = {
+            'x' : np.zeros((len(u_xs), len(u_ys))),
+            'y' : np.zeros((len(u_xs), len(u_ys))),
+        }
         for i,x in enumerate(u_xs):
             for j,y in enumerate(u_ys):
                 match = (xs==x) & (ys==y)
                 mat[i,j,:] = np.mean(space_resp[match,:], axis=0)
+                idx_mat['x'][i,j] = x
+                idx_mat['y'][i,j] = y
+        if return_idx:
+            return mat, idx_mat
         return mat        
     
     def _pref_tfsf(self, w):
@@ -353,7 +378,6 @@ class NishiStim(FilterInfo):
         sfs = np.array(self.stim_tfsf['sf'])
         u_sfs = np.unique(sfs)
         mat = np.zeros((len(u_sfs), len(u_tfs), w.shape[1]))
-        print(mat.shape)
         for i,sf in enumerate(u_sfs):
             for j,tf in enumerate(u_tfs):
                 match = (sfs==sf) & (tfs==tf)
@@ -415,12 +439,13 @@ class NishiStim(FilterInfo):
         vlim = np.max(np.abs(tfsf))
         vlim = np.max([np.max(np.abs(space)), vlim])
 
-        xs = np.array(self.stim_space['filt_x'])
+        xs = np.array(self.stim_space['stim_x'])
         u_xs = np.unique(xs)
-        ys = np.array(self.stim_space['filt_y'])
+        ys = np.array(self.stim_space['stim_y'])
         u_ys = np.unique(ys)        
         # Define image extent
-        extent = [-1*self.aspect_ratio, 1*self.aspect_ratio, -1, 1]
+        # extent = [-1*self.aspect_ratio, 1*self.aspect_ratio, -1, 1]
+        extent = [-self.screen_width_dov/2,self.screen_width_dov/2,-self.screen_height_dov/2, self.screen_height_dov/2]
 
         # Compute tick positions to center the labels in each grid cell
         x_ticks = np.linspace(extent[0], extent[1], len(u_xs), endpoint=False) + (extent[1] - extent[0]) / len(u_xs) / 2
@@ -433,10 +458,10 @@ class NishiStim(FilterInfo):
         )
 
         # Set centered ticks and labels
-        ax[0].set_xticks(x_ticks)
-        ax[0].set_xticklabels([f'{i:.2f}' for i in u_xs])
-        ax[0].set_yticks(y_ticks)
-        ax[0].set_yticklabels([f'{i:.2f}' for i in u_ys])
+        # ax[0].set_xticks(x_ticks)
+        # ax[0].set_xticklabels([f'{i:.2f}' for i in u_xs])
+        # ax[0].set_yticks(y_ticks)
+        # ax[0].set_yticklabels([f'{i:.2f}' for i in u_ys])
 
 
         tfs = np.array(self.stim_tfsf['tf'])
@@ -467,13 +492,13 @@ class NishiStim(FilterInfo):
         plt.colorbar(img, ax=ax[0])
 
 
-def generate_dynamic_gaussian_noise(grid_size, grid_location, vhsize, n_frames, mean=50.0, low=0.0, high=100.0, seed=None, **kwargs):
+def generate_dynamic_gaussian_noise(grid_size, grid_location, vhsize, nframe, mean=50.0, low=0.0, high=100.0, seed=None, **kwargs):
     """
     Generates a dynamic Gaussian white noise movie for a specific grid cell.
 
     Returns:
     --------
-    movie : np.ndarray, shape (n_frames, cell_height, cell_width)
+    movie : np.ndarray, shape (nframe, cell_height, cell_width)
         Dynamic Gaussian white noise movie for the specified grid cell.
     mid_x : int
         X coordinate (pixel) of the center of the grid cell on the full screen.
@@ -505,10 +530,10 @@ def generate_dynamic_gaussian_noise(grid_size, grid_location, vhsize, n_frames, 
     mid_y = y_start + cell_height / 2
 
     # Create full-screen movie initialized to zero
-    movie_full = np.zeros((n_frames, pix_y, pix_x), dtype=float) + mean
+    movie_full = np.zeros((nframe, pix_y, pix_x), dtype=float) + mean
 
     # Generate Gaussian white noise for the patch region
-    noise_patch = np.random.uniform(low=low, high=high, size=(n_frames, cell_height, cell_width))
+    noise_patch = np.random.uniform(low=low, high=high, size=(nframe, cell_height, cell_width))
 
     # Insert noise into the full-screen movie
     movie_full[:, y_start:y_end, x_start:x_end] = noise_patch
@@ -518,7 +543,7 @@ def generate_dynamic_gaussian_noise(grid_size, grid_location, vhsize, n_frames, 
 def mk_drifting_grating_movie(vhsize,
                                stimulus_fps,
                                aspect_ratio='auto',
-                               nframe=24,
+                               nframe=60,
                                centerh=0.5,
                                direction=45.0,
                                spatial_freq=16.0,
@@ -600,7 +625,7 @@ def mk_drifting_grating_movie(vhsize,
 
 if __name__ == "__main__":
     # Create a filter info object
-    filter_info = NishiStim()
+    filter_info = StimEstimate()
     # Test the filter info class
     filter_info.test()
     # Print the filter info class
