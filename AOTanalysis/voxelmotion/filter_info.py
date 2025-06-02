@@ -20,6 +20,27 @@ import pandas as pd
 # )
 # # 11845 filters
 
+def _cart2pol(x, y):
+    r = np.hypot(x, y)
+    theta = np.arctan2(y, x)
+    return r, theta
+
+def _pol2cart(r, theta):
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return x, y    
+
+def add_pol_cart(pdict):
+    if 'x' in pdict.keys():
+        ecc,pol = _cart2pol(pdict['x'], pdict['y'])
+        pdict['ecc'] = ecc
+        pdict['pol'] = pol
+    elif 'ecc' in pdict.keys():
+        x,y = _pol2cart(pdict['ecc'], pdict['pol'])
+        pdict['x']=x
+        pdict['y']=y
+    return pdict
+
 
 class FilterInfo:
     def __init__(self, vhsize=(1080, 1920), fps=24,
@@ -81,7 +102,7 @@ class FilterInfo:
         # cache numpy arrays for speed
         self._arrays = {p: self.filter_df[p].to_numpy() for p in self.params_list}
 
-    def p_selectivity(self, w, param):
+    def filter_selectivity(self, w, param):
         """ compute the selectivity to a features
         selectivity_index = (Max Weight - min Weight) / (sum Weights)
         """
@@ -115,34 +136,56 @@ class FilterInfo:
         # sum of weights per column
         # How to deal with negative weights? 
         # -> problem is you can get sumw nearly 0...
-        if option=='clamp':
+        if option=='clamp-pos':
             # No negative weights
             w = np.maximum(w, 0)
             wsum = w.sum(axis=0)
+        elif 'clamp-top-n-' in option:
+            # Only include the top N weights...
+            x = int(option.split('-')[-1])            
+            abs_w = np.abs(w)
+            n,m = abs_w.shape
+            x = 50
+            # 2) For each column j, find the row‐indices of the top x absolute values.
+            #    np.argpartition(abs_w, -x, axis=0) rearranges each column so that
+            #    its x largest entries (by absolute value) are in the last x rows (in arbitrary order).
+            #    By slicing [-x:] along axis=0, we get those row‐indices for each column.
+            top_rows = np.argpartition(abs_w, -x, axis=0)[-x:, :]   # shape: (x, m)
+
+            # 3) Build a boolean mask of shape (n, m), initially False.
+            keep_mask = np.zeros((n, m), dtype=bool)
+
+            # 4) We need to set keep_mask[i, j] = True whenever i ∈ top_rows[:, j].
+            #    Make a “column index” array of shape (x, m) so we can do this all at once:
+            cols = np.arange(m)                       # shape: (m,)
+            cols_broadcast = np.broadcast_to(cols, (x, m))  # shape: (x, m)
+
+            # 5) Mark those positions as True:
+            keep_mask[top_rows, cols_broadcast] = True
+
+            # 6) Finally, zero out everything except where keep_mask is True:
+            w = np.where(keep_mask, w, 0)            
+            wsum = abs_w.sum(axis=0)
         elif option=='L1':
             # Avoids wsum=0
             wsum = np.abs(w).sum(axis=0)
         elif option=='none':
             wsum = w.sum(axis=0)
+        
+        mpos = {}
+        mpos['x'] = ((w * self._arrays['x'][:, None]).sum(axis=0) / wsum)
+        mpos['y'] = ((w * self._arrays['y'][:, None]).sum(axis=0) / wsum)
+        mpos['ecc'],mpos['pol']  = self._cart2pol(mpos['x'], mpos['y'])
+
         out = {}
         for p in params: 
-            if p in ['x', 'y', 'SF', 'size', 'TF', 'vel']:
+            if p in ['x', 'y', 'ecc', 'pol']:
+                out[p] = mpos[p]
+            elif p in ['SF', 'size', 'TF', 'vel']:
                 # straightforward means
                 arr = self._arrays[p][:, None]  # shape (F,1)
                 mean_vals = (w * arr).sum(axis=0) / wsum
                 out[p] = mean_vals
-            elif p in ['pol']:
-                # polarity: from x,y means
-                mx = ((w * self._arrays['x'][:, None]).sum(axis=0) / wsum)
-                my = ((w * self._arrays['y'][:, None]).sum(axis=0) / wsum)
-                _, pol_mean = self._cart2pol(mx, my)
-                out['pol'] = pol_mean
-            elif p in ['ecc']:
-                # polarity: from x,y means
-                mx = ((w * self._arrays['x'][:, None]).sum(axis=0) / wsum)
-                my = ((w * self._arrays['y'][:, None]).sum(axis=0) / wsum)
-                ecc_mean,_ = self._cart2pol(mx, my)
-                out['ecc'] = ecc_mean
             elif p in ['dir']:
                 # direction: circular mean
                 theta = np.deg2rad(self._arrays['dir'])[:, None]
@@ -153,7 +196,7 @@ class FilterInfo:
         # assemble DataFrame
         return pd.DataFrame(out)
 
-    def filter_max(self, w, params=None):
+    def filter_max(self, w, params=None, option='pos'):
         """
         For each weight vector, return parameters at index of max weight.
         weights: array (n_filters, N)
@@ -168,7 +211,10 @@ class FilterInfo:
         if params is None:
             params = self.params_list
         # index of max per column
-        idx = w.argmax(axis=0)
+        if option == 'pos':
+            idx = w.argmax(axis=0)
+        elif option == 'abs':
+            idx = np.abs(w).argmax(axis=0)
         out = {}
         for p in params:
             arr = self._arrays[p]
@@ -204,14 +250,10 @@ class FilterInfo:
         return xscr, yscr
 
     def _cart2pol(self, x, y):
-        r = np.hypot(x, y)
-        theta = np.arctan2(y, x)
-        return r, theta
+        return _cart2pol(x, y)
     
     def _pol2cart(self, r, theta):
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
-        return x, y    
+        return _pol2cart(r, theta)
 
     def test(self):
         pprint(self.pyramid)
@@ -222,10 +264,9 @@ class FilterInfo:
 class RespEstimate(FilterInfo):
     def __init__(self, **kwargs):
         # Initialize with the FilterInfo class..
-        super().__init__(**kwargs)
-        
+        super().__init__(**kwargs)        
 
-    def _stim_make_space(self,nframe=60, grid_size=(17, 17), **kwargs):
+    def stim_make_space(self,nframe=60, grid_size=(17, 17), **kwargs):
         # Going to splid 
         print(self.vhsize)
         downsample = kwargs.get('downsample', 1)
@@ -263,9 +304,8 @@ class RespEstimate(FilterInfo):
                 self.stim_space['filt_resp_avg'].append(
                     np.mean(fresp, axis=0)
                 )
-                
-    
-    def _stim_make_gray(self,nframe=60, **kwargs):
+                    
+    def stim_make_gray(self,nframe=60, **kwargs):
         # Going to splid 
         downsample = kwargs.get('downsample', 1)
         vhsize = self.vhsize[0]//downsample, self.vhsize[1]//downsample
@@ -277,7 +317,7 @@ class RespEstimate(FilterInfo):
         self.stim_gray['filt_resp'] = fresp.copy()
         self.stim_gray['filt_resp_avg'] = np.mean(fresp, axis=0)        
 
-    def _stim_make_tfsf(self, nframe=60,  **kwargs):
+    def stim_make_tfsf(self, nframe=60,  **kwargs):
         '''
         Generate full-field drifting sine-wave gratings at specified temporal
         frequency (tf), spatial frequency (sf), and orientation (dir).
@@ -321,7 +361,9 @@ class RespEstimate(FilterInfo):
                     if sf==0.0:
                         # only one direction for sf 0
                         break
-    def _pref_space(self, w, **kwargs):
+    
+    # ******************************
+    def stim_resp_space(self, w, **kwargs):
         ''' Compute spatial preference
         
         w : weights n filters x n vox
@@ -337,7 +379,7 @@ class RespEstimate(FilterInfo):
         if w.shape[0] != self.n_filters:
             raise ValueError("Weights must have shape (n_filters, N)")                
 
-        gray_resp = self._gray_resp(w)
+        gray_resp = self.stim_gray_resp(w)
         filt_resp_mat = np.vstack(self.stim_space['filt_resp_avg'])
         space_resp = (filt_resp_mat @ w) - gray_resp[...,np.newaxis].T
         # Now average over 
@@ -360,15 +402,38 @@ class RespEstimate(FilterInfo):
             return mat, idx_mat
         return mat        
     
-    def _pref_tfsf(self, w):
+    def stim_pref_space(self, w, **kwargs):
+        '''Return the preference
+        '''
+        wspace = self.stim_resp_space(w=w, return_idx=True, **kwargs)
+        return self._stim_pref_space(wspace=wspace)        
+
+    def _stim_pref_space(self, wspace):
+        # Get indices of maximum value for each slice
+        max_xy = [np.argmax(wspace[:,:,i].flatten()) for i in range(wspace.shape[-1])] 
+        # Now the 
+        # max_xy will contain the (x,y) coordinates for the maximum value in each slice
+        # max_xy[:, 0] contains all x coordinates 
+        # max_xy[:, 1] contains all y coordinates
+        max_x = np.array([self.stim_space['stim_x'][i] for i in max_xy])
+        max_y = np.array([self.stim_space['stim_y'][i] for i in max_xy])        
+        stim_pref = {
+            'x' : max_x,
+            'y' : max_y,
+        }
+        stim_pref = add_pol_cart(stim_pref)
+        return stim_pref
+
+    def stim_resp_tfsf(self, w, **kwargs):
         ''' Compute tf & sf preference
         '''
+        return_idx = kwargs.get('return_idx', False)
         if w.ndim == 1:
             w = w[:, None]
         if w.shape[0] != self.n_filters:
             raise ValueError("Weights must have shape (n_filters, N)")                
 
-        gray_resp = self._gray_resp(w)
+        gray_resp = self.stim_gray_resp(w)
         filt_resp_mat = np.vstack(self.stim_tfsf['filt_resp_avg'])
         tfsf_resp = (filt_resp_mat @ w) - gray_resp[...,np.newaxis].T
 
@@ -378,23 +443,54 @@ class RespEstimate(FilterInfo):
         sfs = np.array(self.stim_tfsf['sf'])
         u_sfs = np.unique(sfs)
         mat = np.zeros((len(u_sfs), len(u_tfs), w.shape[1]))
+        idx_mat = {
+            'tf' : np.zeros((len(u_sfs), len(u_tfs))),
+            'sf' : np.zeros((len(u_sfs), len(u_tfs)))
+        }
         for i,sf in enumerate(u_sfs):
             for j,tf in enumerate(u_tfs):
                 match = (sfs==sf) & (tfs==tf)
                 mat[i,j,:] = np.mean(tfsf_resp[match,:], axis=0)
+                idx_mat['sf'][i,j]=sf
+                idx_mat['tf'][i,j]=tf
+        if return_idx:
+            return mat, idx_mat
+        return mat    
 
-        return mat
-    
+    def stim_pref_tfsf(self, w, **kwargs):
+        '''Return the preference
+        '''
+        wtfsf,idx = self.stim_resp_tfsf(w=w,  return_idx=True,**kwargs)
+        return self._stim_pref_tfsf(wtfsf=wtfsf, idx=idx)        
 
-    def _pref_dir(self, w):
+    def _stim_pref_tfsf(self, wtfsf,idx):
+        # Get indices of maximum value for each slice
+        max_tfsf = [np.argmax(wtfsf[:,:,i].flatten()) for i in range(wtfsf.shape[-1])] 
+        # Now the 
+        idx_tf = idx['tf'].flatten()
+        idx_sf = idx['sf'].flatten()
+        max_tf = np.array([idx_tf[i] for i in max_tfsf])
+        max_sf = np.array([idx_sf[i] for i in max_tfsf])        
+        vel = np.zeros_like(max_sf)
+        valid_vel = (max_sf!=0) & (max_tf!=0)
+        vel[valid_vel] = max_tf[valid_vel] / max_sf[valid_vel]
+        stim_pref = {
+            'tf' : max_tf,
+            'sf' : max_sf,
+            'vel' : vel
+        }
+        return stim_pref
+
+    def stim_resp_dir(self, w, **kwargs):
         ''' Compute tf & sf preference
         '''
+        return_idx = kwargs.get('return_idx', False)
         if w.ndim == 1:
             w = w[:, None]
         if w.shape[0] != self.n_filters:
             raise ValueError("Weights must have shape (n_filters, N)")                
 
-        gray_resp = self._gray_resp(w)
+        gray_resp = self.stim_gray_resp(w)
         filt_resp_mat = np.vstack(self.stim_tfsf['filt_resp_avg'])
         tfsf_resp = (filt_resp_mat @ w) - gray_resp[...,np.newaxis].T
 
@@ -407,16 +503,36 @@ class RespEstimate(FilterInfo):
         u_dirs = np.unique(dirs)
 
         mat = np.zeros((len(u_dirs), w.shape[1]))
-        print(mat.shape)
+        idx_mat = {
+            'dir' : np.zeros(len(u_dirs)),
+        }
         for i,dir in enumerate(u_dirs):
-            
+            # Only where SF & TF is not zero 
             match = (sfs!=0) & (tfs!=0) & (dirs==dir)
             mat[i,:] = np.mean(tfsf_resp[match,:], axis=0)
-
+            idx_mat['dir'][i] = dir
+        if return_idx:
+            return mat, idx_mat
         return mat
+    
+    def stim_pref_dir(self, w, **kwargs):
+        '''Return the preference
+        '''
+        wdir,idx = self.stim_resp_dir(w=w,  return_idx=True,**kwargs)
+        return self._stim_pref_dir(wdir=wdir, idx=idx)        
 
+    def _stim_pref_dir(self, wdir, idx):
+        # Get indices of maximum value for each slice
+        max_dir_idx = [np.argmax(wdir[:,i].flatten()) for i in range(wdir.shape[-1])] 
+        idx_dir = idx['dir'].flatten()
+        # Now the 
+        max_dir = np.array([idx_dir[i] for i in max_dir_idx])
+        stim_pref = {
+            'dir' : max_dir,
+        }
+        return stim_pref
 
-    def _gray_resp(self, w):
+    def stim_gray_resp(self, w):
         ''' Compute weighted response to gray stimuli
 
         w : n filter x n vox
@@ -431,13 +547,14 @@ class RespEstimate(FilterInfo):
         gray_resp = (self.stim_gray['filt_resp_avg'][...,np.newaxis] * w).sum(axis=0)
         return gray_resp
 
-    def nish_stim_plot(self, w):
+    def nish_stim_plot(self, w, **kwargs):
+        return_fig = kwargs.get('return_fig', False)
         import matplotlib.pyplot as plt
-        tfsf = self._pref_tfsf(w)
-        space = self._pref_space(w)
+        tfsf, idx_tfsf = self.stim_resp_tfsf(w, return_idx=True)
+        space, idx_space = self.stim_resp_space(w, return_idx=True)
         fig, ax = plt.subplots(1,2, figsize=(10,5), width_ratios=(4,1))
-        vlim = np.max(np.abs(tfsf))
-        vlim = np.max([np.max(np.abs(space)), vlim])
+        vlim_tfsf = np.max(np.abs(tfsf))
+        vlim_space = np.max(np.max(np.abs(space)))
 
         xs = np.array(self.stim_space['stim_x'])
         u_xs = np.unique(xs)
@@ -451,18 +568,14 @@ class RespEstimate(FilterInfo):
         x_ticks = np.linspace(extent[0], extent[1], len(u_xs), endpoint=False) + (extent[1] - extent[0]) / len(u_xs) / 2
         y_ticks = np.linspace(extent[2], extent[3], len(u_ys), endpoint=False) + (extent[3] - extent[2]) / len(u_ys) / 2
 
-        ax[0].imshow(
-            space, 
-            vmin=-vlim,vmax=vlim,cmap='RdBu_r',
+        img_space = ax[0].imshow(
+            # np.flipud(idx_space['x'].T), #space, 
+            np.flipud(space.squeeze().T),
+            vmin=-vlim_space,vmax=vlim_space,
+            cmap='RdBu_r',
             extent=extent
         )
-
-        # Set centered ticks and labels
-        # ax[0].set_xticks(x_ticks)
-        # ax[0].set_xticklabels([f'{i:.2f}' for i in u_xs])
-        # ax[0].set_yticks(y_ticks)
-        # ax[0].set_yticklabels([f'{i:.2f}' for i in u_ys])
-
+        plt.colorbar(img_space, ax=ax[0])
 
         tfs = np.array(self.stim_tfsf['tf'])
         u_tfs = np.unique(tfs)
@@ -476,11 +589,13 @@ class RespEstimate(FilterInfo):
         y_ticks = np.linspace(extent[2], extent[3], len(u_sfs), endpoint=False) + (extent[3] - extent[2]) / len(u_sfs) / 2
 
         # Plot the image
-        img = ax[1].imshow(
+        img_tfsf = ax[1].imshow(
             tfsf, 
-            vmin=-vlim, vmax=vlim, cmap='RdBu_r',
+            vmin=-vlim_tfsf, vmax=vlim_tfsf, 
+            cmap='RdBu_r',
             extent=extent, origin='lower'  # origin='lower' ensures y-ticks align properly
         )
+        
 
         # Set centered ticks and labels
         ax[1].set_xticks(x_ticks)
@@ -489,7 +604,27 @@ class RespEstimate(FilterInfo):
         ax[1].set_yticklabels([f'{i:.2f}' for i in u_sfs])
         ax[1].set_xlabel('TF')
         ax[1].set_ylabel('SF')
-        plt.colorbar(img, ax=ax[0])
+        plt.colorbar(img_tfsf, ax=ax[1])
+        if return_fig:
+            return fig, ax
+
+    def nish_stim_plot2(self, w, **kwargs):
+        return_fig = kwargs.get('return_fig', False)
+        import matplotlib.pyplot as plt
+        tfsf, idx_tfsf = self.stim_resp_tfsf(w, return_idx=True)
+        space, idx_space = self.stim_resp_space(w, return_idx=True)
+        fig, ax = plt.subplots(1,2, figsize=(10,5), width_ratios=(4,1))
+        vlim_tfsf = np.max(np.abs(tfsf))
+        vlim_space = np.max(np.max(np.abs(space)))
+        print(space.shape)
+        print(idx_space['x'].shape)
+        pcm = ax[0].scatter(
+            x=idx_space['x'].flatten(), y=idx_space['y'].flatten(),
+            c=space.flatten(), 
+            # shading='auto', 
+            vmin=-vlim_space,vmax=vlim_space,cmap='RdBu_r',
+        )
+
 
 
 def generate_dynamic_gaussian_noise(grid_size, grid_location, vhsize, nframe, mean=50.0, low=0.0, high=100.0, seed=None, **kwargs):
@@ -619,14 +754,125 @@ def mk_drifting_grating_movie(vhsize,
     return movie
 
 
+########
+
+import numpy as np
+import numpy as np
 
 
+def fit_sym_gaussians_with_offset_moments(X, Y, Z):
+    """
+    Fit a symmetric 2D Gaussian + constant offset to each slice Z[:,:,k]
+    using analytic (moment‐based) estimates, and compute R² for each fit.
 
+    Parameters
+    ----------
+    X : ndarray, shape (n, m)
+        x-coordinate at each pixel.
+    Y : ndarray, shape (n, m)
+        y-coordinate at each pixel.
+    Z : ndarray, shape (n, m, c)
+        Measured intensities.
 
-if __name__ == "__main__":
-    # Create a filter info object
-    filter_info = StimEstimate()
-    # Test the filter info class
-    filter_info.test()
-    # Print the filter info class
-    pprint(filter_info.__dict__)
+    Returns
+    -------
+    pdict : dict with keys
+        'x'         : ndarray, shape (c,)
+                      Fitted x0_k for each slice k.
+        'y'         : ndarray, shape (c,)
+                      Fitted y0_k for each slice k.
+        'size'      : ndarray, shape (c,)
+                      Fitted σ_k for each slice k.
+        'amplitude' : ndarray, shape (c,)
+                      Fitted A_k for each slice k.
+        'offset'    : ndarray, shape (c,)
+                      Fitted background offset b_k for each slice k.
+        'r2'        : ndarray, shape (c,)
+                      R² of each fit (coefficient of determination). NaN if degenerate.
+    """
+    # Number of slices
+    _, _, num_slices = Z.shape
+
+    # Pre-allocate outputs
+    xs = np.zeros(num_slices, dtype=float)
+    ys = np.zeros(num_slices, dtype=float)
+    sigmas = np.zeros(num_slices, dtype=float)
+    amps = np.zeros(num_slices, dtype=float)
+    offs = np.zeros(num_slices, dtype=float)
+    r2s = np.zeros(num_slices, dtype=float)
+
+    # Flattened coordinates (same for every slice)
+    X_flat = X.ravel()
+    Y_flat = Y.ravel()
+    coords = np.vstack((X_flat, Y_flat))  # shape (2, n*m)
+
+    for k in range(num_slices):
+        Zk = Z[:, :, k]
+        Z_flat = Zk.ravel()
+
+        # 1) Estimate offset b as the minimum pixel value
+        b_hat = np.min(Z_flat)
+        offs[k] = b_hat
+
+        # 2) Subtract offset and clip negative residuals to zero
+        Zp = Z_flat - b_hat
+        Zp[Zp < 0] = 0.0
+
+        # 3) Total “mass”
+        M = np.sum(Zp)
+        if M <= 0:
+            # Degenerate slice (flat or all background)
+            xs[k] = 0.0 #np.nan
+            ys[k] = 0.0 #np.nan
+            sigmas[k] =0.0 # np.nan
+            amps[k] = 0.0 #np.nan
+            r2s[k] = 0.0 #np.nan
+            continue
+
+        # 4) Centroid (first moments)
+        x0 = np.sum(X_flat * Zp) / M
+        y0 = np.sum(Y_flat * Zp) / M
+        xs[k], ys[k] = x0, y0
+
+        # 5) Second moment for sigma
+        dx2 = (X_flat - x0)**2 + (Y_flat - y0)**2
+        S = np.sum(dx2 * Zp)
+        sigma2 = S / M
+        sigma = np.sqrt(sigma2)
+        sigmas[k] = sigma
+
+        # 6) Amplitude: peak minus background
+        A = np.max(Zp)
+        amps[k] = A
+
+        # 7) Compute R²
+        #    Z_pred(i,j) = A * exp( - ((x_i-x0)^2+(y_j-y0)^2) / (2σ²) ) + b_hat
+        exponent = -dx2 / (2 * sigma2)
+        Z_pred_flat = A * np.exp(exponent) + b_hat
+
+        #    SS_res and SS_tot
+        ss_res = np.sum((Z_flat - Z_pred_flat)**2)
+        z_mean = np.mean(Z_flat)
+        ss_tot = np.sum((Z_flat - z_mean)**2)
+
+        if ss_tot == 0:
+            # If all Z_flat are identical, define R² = 1 if model matches exactly
+            if np.allclose(Z_flat, Z_pred_flat, atol=1e-8):
+                r2 = 1.0
+            else:
+                r2 = 0.0
+        else:
+            r2 = 1.0 - (ss_res / ss_tot)
+        r2s[k] = r2
+
+    pdict = {
+        'x': xs,
+        'y': ys,
+        'size': sigmas,
+        'amplitude': amps,
+        'offset': offs,
+        'r2': r2s,
+    }
+    pdict = add_pol_cart(pdict)
+
+    return pdict
