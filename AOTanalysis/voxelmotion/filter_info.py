@@ -41,7 +41,12 @@ def add_pol_cart(pdict):
         pdict['y']=y
     return pdict
 
-
+def w_selectivity(w):
+    if w.ndim == 1:
+        w = w[:, None]
+    selectivity = (np.max(w, axis=0) - np.min(w, axis=0)) / \
+        np.sum(np.abs(w), axis=0)    
+    return selectivity
 class FilterInfo:
     def __init__(self, vhsize=(1080, 1920), fps=24,
                  spatial_frequencies=[0, 2, 4, 8, 16, 32], **kwargs):
@@ -62,13 +67,14 @@ class FilterInfo:
         # screen geometry
         self.screen_distance = kwargs.get("screen_distance", 196)
         self.screen_height = kwargs.get("screen_height", 39.3)
+        self.shrinkage_ratio = kwargs.get("shrinkage_ratio", 0.7)
         self.screen_width = self.aspect_ratio * self.screen_height
         self.screen_height_dov = 2 * np.degrees(
             np.arctan(self.screen_height / (2 * self.screen_distance))
-        )
+        ) * self.shrinkage_ratio
         self.screen_width_dov = 2 * np.degrees(
             np.arctan(self.screen_width / (2 * self.screen_distance))
-        )
+        ) * self.shrinkage_ratio
 
         # 1 in screen coordinates corresponds dov_per_image in DoV
         self.dov_per_scr1 = self.screen_height_dov  
